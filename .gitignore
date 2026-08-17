@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Virtual environments
+.venv/
+.venv_cuda/
+venv/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+
+# Models / large files
+models/
+*.safetensors
+*.bin
+*.gguf
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
