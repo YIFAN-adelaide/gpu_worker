@@ -481,16 +481,11 @@ def _load_models() -> None:
             flush=True,
         )
         small_llm = ChatModel(
-            model_path=(
-                SETTINGS.small_llm_model_path
-            ),
-            enable_thinking=(
-                SETTINGS.small_llm_enable_thinking
-            ),
-            trust_remote_code=(
-                SETTINGS.trust_remote_code
-            ),
+            model_path=SETTINGS.small_llm_model_path,
+            enable_thinking=SETTINGS.small_llm_enable_thinking,
+            trust_remote_code=SETTINGS.trust_remote_code,
             device_map=SETTINGS.device_map,
+            backend="transformers",
         )
 
         decomposer = QueryDecomposer(
@@ -498,6 +493,14 @@ def _load_models() -> None:
             max_new_tokens=(
                 SETTINGS.decompose_max_new_tokens
             ),
+        )
+
+        response_llm = ChatModel(
+            model_path=SETTINGS.response_llm_model_path,
+            enable_thinking=SETTINGS.response_llm_enable_thinking,
+            trust_remote_code=SETTINGS.trust_remote_code,
+            device_map=SETTINGS.device_map,
+            backend="gptqmodel",
         )
 
         print(

@@ -9,6 +9,7 @@ from typing import Any
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from gptqmodel import GPTQModel
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,10 +38,12 @@ class ChatModel:
         enable_thinking: bool = False,
         trust_remote_code: bool = True,
         device_map: str = "auto",
+        backend: str = "transformers",
     ) -> None:
         if not model_path or not model_path.strip():
             raise ValueError("model_path cannot be empty.")
 
+        self.backend = backend.strip().lower()
         self.model_path = model_path
         self.model_name = Path(
             model_path.rstrip("/\\")
@@ -52,23 +55,40 @@ class ChatModel:
             trust_remote_code=trust_remote_code,
         )
 
-        model_kwargs: dict[str, Any] = {
-            "trust_remote_code": trust_remote_code,
-        }
+        if self.backend == "gptqmodel":
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "GPTQModel backend requires CUDA."
+                )
 
-        if torch.cuda.is_available():
-            model_kwargs["device_map"] = device_map
-            # "auto" lets quantized checkpoints keep their own storage dtype
-            # rather than forcing them back to fp16.
-            model_kwargs["torch_dtype"] = "auto"
+            self.model = GPTQModel.load(
+                model_path,
+                device="cuda:0",
+                trust_remote_code=trust_remote_code,
+            )
+
+        elif self.backend == "transformers":
+            model_kwargs: dict[str, Any] = {
+                "trust_remote_code": trust_remote_code,
+            }
+
+            if torch.cuda.is_available():
+                model_kwargs["device_map"] = device_map
+                model_kwargs["torch_dtype"] = "auto"
+            else:
+                model_kwargs["torch_dtype"] = torch.float32
+
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                **model_kwargs,
+            )
+
         else:
-            model_kwargs["torch_dtype"] = torch.float32
-
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            **model_kwargs,
-        )
-        self.model.eval()
+            raise ValueError(
+                f"Unsupported chat model backend: {self.backend!r}"
+            )
+        if hasattr(self.model, "eval"):
+            self.model.eval()
 
         if (
             not torch.cuda.is_available()
