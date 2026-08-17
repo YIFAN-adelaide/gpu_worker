@@ -495,13 +495,6 @@ def _load_models() -> None:
             ),
         )
 
-        response_llm = ChatModel(
-            model_path=SETTINGS.response_llm_model_path,
-            enable_thinking=SETTINGS.response_llm_enable_thinking,
-            trust_remote_code=SETTINGS.trust_remote_code,
-            device_map=SETTINGS.device_map,
-            backend="gptqmodel",
-        )
 
         print(
             "Shared small model loaded "
@@ -510,36 +503,27 @@ def _load_models() -> None:
         )
 
     if SETTINGS.load_response_llm:
-        assert (
-            SETTINGS.response_llm_model_path
-            is not None
-        )
+        assert SETTINGS.response_llm_model_path is not None
 
-        # If both roles intentionally point to the exact
-        # same physical model, share it rather than loading
-        # a duplicate copy.
         if (
             small_llm is not None
             and SETTINGS.response_llm_model_path
             == SETTINGS.small_llm_model_path
         ):
             response_llm = small_llm
+
         else:
             print(
                 "Loading response chat model...",
                 flush=True,
             )
+
             response_llm = ChatModel(
-                model_path=(
-                    SETTINGS.response_llm_model_path
-                ),
-                enable_thinking=(
-                    SETTINGS.response_llm_enable_thinking
-                ),
-                trust_remote_code=(
-                    SETTINGS.trust_remote_code
-                ),
+                model_path=SETTINGS.response_llm_model_path,
+                enable_thinking=SETTINGS.response_llm_enable_thinking,
+                trust_remote_code=SETTINGS.trust_remote_code,
                 device_map=SETTINGS.device_map,
+                backend="gptqmodel",   # ← THIS IS THE IMPORTANT LINE
             )
 
         print(
