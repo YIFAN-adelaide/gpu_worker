@@ -69,6 +69,9 @@ small_llm: ChatModel | None = None
 decomposer: QueryDecomposer | None = None
 response_llm: ChatModel | None = None
 
+# Approximate static VRAM added when the response model is loaded.
+response_model_vram_gb: float | None = None
+
 
 # ---------------------------------------------------------------------------
 # Shared GPU queue
@@ -101,6 +104,19 @@ gpu_executor: ThreadPoolExecutor | None = None
 current_gpu_job_type: str | None = None
 current_gpu_request_id: str | None = None
 completed_gpu_jobs = 0
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationExecution:
+    generation: ChatGeneration
+    metadata: dict[str, Any]
+
+
+_GIB = 1024 ** 3
+
+
+def _to_gib(value_bytes: int | float) -> float:
+    return round(float(value_bytes) / _GIB, 3)
 
 
 # ---------------------------------------------------------------------------
@@ -443,6 +459,7 @@ def _load_models() -> None:
     global small_llm
     global decomposer
     global response_llm
+    global response_model_vram_gb
 
     print(
         "Starting ExperteaseAI GPU worker...",
@@ -511,6 +528,7 @@ def _load_models() -> None:
             == SETTINGS.small_llm_model_path
         ):
             response_llm = small_llm
+            response_model_vram_gb = 0.0
 
         else:
             print(
@@ -518,13 +536,38 @@ def _load_models() -> None:
                 flush=True,
             )
 
+            free_before: int | None = None
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                free_before, _total_before = (
+                    torch.cuda.mem_get_info()
+                )
+
             response_llm = ChatModel(
                 model_path=SETTINGS.response_llm_model_path,
                 enable_thinking=SETTINGS.response_llm_enable_thinking,
                 trust_remote_code=SETTINGS.trust_remote_code,
                 device_map=SETTINGS.device_map,
-                backend="gptqmodel",   # ← THIS IS THE IMPORTANT LINE
+                backend="gptqmodel",
             )
+
+            if (
+                torch.cuda.is_available()
+                and free_before is not None
+            ):
+                torch.cuda.synchronize()
+                free_after, _total_after = (
+                    torch.cuda.mem_get_info()
+                )
+                response_model_vram_gb = _to_gib(
+                    max(0, free_before - free_after)
+                )
+                print(
+                    "Approximate response-model VRAM: "
+                    f"{response_model_vram_gb:.3f} GiB",
+                    flush=True,
+                )
 
         print(
             "Response model loaded.",
@@ -548,11 +591,13 @@ def _unload_models() -> None:
     global small_llm
     global decomposer
     global response_llm
+    global response_model_vram_gb
 
     embedding_model = None
     decomposer = None
     response_llm = None
     small_llm = None
+    response_model_vram_gb = None
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -793,17 +838,18 @@ async def decompose(
 
 def _generate(
     req: GenerateRequest,
-) -> ChatGeneration:
+) -> GenerationExecution:
+    """Run one generation job.
+
+    Detailed CUDA memory telemetry is collected only for the response profile.
+    """
+
     if req.profile == "decision":
         model = small_llm
-        default_max = (
-            SETTINGS.decision_max_output_tokens
-        )
+        default_max = SETTINGS.decision_max_output_tokens
     else:
         model = response_llm
-        default_max = (
-            SETTINGS.response_max_output_tokens
-        )
+        default_max = SETTINGS.response_max_output_tokens
 
     if model is None:
         raise HTTPException(
@@ -822,21 +868,112 @@ def _generate(
         if req.max_output_tokens is not None
         else default_max
     )
-
-    # The worker owns the hard profile ceiling even if
-    # a client asks for an unexpectedly large generation.
     max_output_tokens = min(
         requested_max,
         default_max,
     )
 
-    return model.generate(
-        messages=[
-            message.model_dump(mode="json")
-            for message in req.messages
-        ],
+    messages = [
+        message.model_dump(mode="json")
+        for message in req.messages
+    ]
+
+    if req.profile != "response":
+        generation = model.generate(
+            messages=messages,
+            max_new_tokens=max_output_tokens,
+            temperature=req.temperature,
+        )
+        return GenerationExecution(
+            generation=generation,
+            metadata={},
+        )
+
+    response_metadata: dict[str, Any] = {
+        "requested_max_output_tokens": int(requested_max),
+        "effective_max_output_tokens": int(max_output_tokens),
+    }
+
+    if response_model_vram_gb is not None:
+        response_metadata["response_model_vram_gb"] = (
+            response_model_vram_gb
+        )
+
+    if not torch.cuda.is_available():
+        generation = model.generate(
+            messages=messages,
+            max_new_tokens=max_output_tokens,
+            temperature=req.temperature,
+        )
+        return GenerationExecution(
+            generation=generation,
+            metadata=response_metadata,
+        )
+
+    device = torch.device("cuda:0")
+    torch.cuda.synchronize(device)
+
+    free_before, total = torch.cuda.mem_get_info(device)
+    allocated_before = torch.cuda.memory_allocated(device)
+    reserved_before = torch.cuda.memory_reserved(device)
+
+    # Safe here because this worker serializes all GPU jobs through one queue.
+    torch.cuda.reset_peak_memory_stats(device)
+
+    generation = model.generate(
+        messages=messages,
         max_new_tokens=max_output_tokens,
         temperature=req.temperature,
+    )
+
+    torch.cuda.synchronize(device)
+
+    free_after, _ = torch.cuda.mem_get_info(device)
+    allocated_after = torch.cuda.memory_allocated(device)
+    reserved_after = torch.cuda.memory_reserved(device)
+    peak_allocated = torch.cuda.max_memory_allocated(device)
+    peak_reserved = torch.cuda.max_memory_reserved(device)
+
+    response_metadata.update(
+        {
+            "gpu_total_vram_gb": _to_gib(total),
+            "gpu_free_before_gb": _to_gib(free_before),
+            "gpu_free_after_gb": _to_gib(free_after),
+            "gpu_used_before_gb": _to_gib(total - free_before),
+            "gpu_used_after_gb": _to_gib(total - free_after),
+            "gpu_used_delta_after_gb": _to_gib(
+                max(0, free_before - free_after)
+            ),
+            "torch_allocated_before_gb": _to_gib(
+                allocated_before
+            ),
+            "torch_allocated_after_gb": _to_gib(
+                allocated_after
+            ),
+            "torch_reserved_before_gb": _to_gib(
+                reserved_before
+            ),
+            "torch_reserved_after_gb": _to_gib(
+                reserved_after
+            ),
+            "torch_peak_allocated_gb": _to_gib(
+                peak_allocated
+            ),
+            "torch_peak_reserved_gb": _to_gib(
+                peak_reserved
+            ),
+            "torch_generation_extra_peak_gb": _to_gib(
+                max(
+                    0,
+                    peak_allocated - allocated_before,
+                )
+            ),
+        }
+    )
+
+    return GenerationExecution(
+        generation=generation,
+        metadata=response_metadata,
     )
 
 
@@ -918,7 +1055,8 @@ async def generate(
 
     _set_job_headers(response, result)
 
-    generation: ChatGeneration = result.value
+    execution: GenerationExecution = result.value
+    generation = execution.generation
 
     return GenerateResponse(
         text=generation.text,
@@ -934,5 +1072,6 @@ async def generate(
         ),
         metadata={
             "profile": req.profile,
+            **execution.metadata,
         },
     )
