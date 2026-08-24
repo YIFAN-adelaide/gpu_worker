@@ -51,7 +51,7 @@ from .models import (
     ChatModel,
     QueryDecomposer,
 )
-from .models.vllm_client import VLLMChatModel
+from .models.vllm_client import VLLMChatModel, VLLMClientError
 
 
 SETTINGS: GPUWorkerSettings = load_settings()
@@ -570,13 +570,18 @@ def _load_models() -> None:
                 api_key=SETTINGS.vllm_api_key,
             )
 
-            # Fail early if vLLM is not running or the expected served model
-            # name is unavailable. No 30B weights are loaded in this process.
-            response_llm.ensure_ready()
+            # Do not require vLLM to be online during worker startup.
+            # This allows the preferred startup order:
+            #   1. GPU worker loads BGE-M3 + Qwen 4B
+            #   2. vLLM starts afterward and sees the remaining GPU memory
+            #
+            # vLLM availability is checked naturally when a response request
+            # is actually sent.
             response_model_vram_gb = None
 
             print(
-                "Response profile connected to vLLM.",
+                "Response profile configured for vLLM "
+                "(runtime availability checked on request).",
                 flush=True,
             )
 
@@ -1129,6 +1134,19 @@ async def generate(
                 SETTINGS.generate_timeout_seconds
             ),
         )
+    except VLLMClientError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": (
+                    "The vLLM response service is unavailable."
+                ),
+                "profile": req.profile,
+                "backend": "vllm",
+                "reason": str(exc),
+            },
+        ) from exc
+
     except torch.cuda.OutOfMemoryError as exc:
         raise HTTPException(
             status_code=507,

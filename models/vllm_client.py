@@ -195,6 +195,27 @@ class VLLMChatModel:
 
         return data
 
+    def is_ready(self) -> bool:
+        """Return whether the configured model is currently served by vLLM.
+
+        This helper never raises and is intentionally not used to gate GPU
+        worker startup.
+        """
+        try:
+            data = self.health()
+        except VLLMClientError:
+            return False
+
+        models = data.get("data")
+        if not isinstance(models, list):
+            return False
+
+        return any(
+            isinstance(item, dict)
+            and str(item.get("id")) == self.model_name
+            for item in models
+        )
+
     def ensure_ready(self) -> None:
         """Raise if the configured served model is not exposed by vLLM."""
 
