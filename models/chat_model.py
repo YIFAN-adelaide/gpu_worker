@@ -71,6 +71,173 @@ class _GenerationTimingStreamer:
         self.ended_at = time.perf_counter()
 
 
+def _print_gptq_runtime_diagnostics(model: Any) -> None:
+    """Print one-time startup diagnostics for the loaded GPTQ response model.
+
+    This is intentionally startup-only. It does not run during generation and
+    therefore should not affect token decoding latency.
+    """
+
+    root_model = getattr(
+        model,
+        "model",
+        model,
+    )
+
+    config = getattr(
+        root_model,
+        "config",
+        None,
+    )
+
+    # ------------------------------------------------------------------
+    # Quantized kernel implementation
+    # ------------------------------------------------------------------
+    kernel_classes = sorted(
+        {
+            (
+                f"{type(module).__module__}."
+                f"{type(module).__name__}"
+            )
+            for module in root_model.modules()
+            if any(
+                keyword in (
+                    (
+                        f"{type(module).__module__}."
+                        f"{type(module).__name__}"
+                    ).lower()
+                )
+                for keyword in (
+                    "marlin",
+                    "triton",
+                    "exllama",
+                    "qlinear",
+                    "quantlinear",
+                )
+            )
+        }
+    )
+
+    print(
+        "GPTQ quantized kernel classes:",
+        kernel_classes,
+        flush=True,
+    )
+
+    # ------------------------------------------------------------------
+    # Device placement
+    # ------------------------------------------------------------------
+    parameter_devices = sorted(
+        {
+            str(parameter.device)
+            for parameter in root_model.parameters()
+        }
+    )
+
+    print(
+        "GPTQ parameter devices:",
+        parameter_devices,
+        flush=True,
+    )
+
+    print(
+        "GPTQ quantization config:",
+        getattr(
+            model,
+            "quantize_config",
+            None,
+        ),
+        flush=True,
+    )
+
+    # ------------------------------------------------------------------
+    # Model / attention / cache
+    # ------------------------------------------------------------------
+    print(
+        "Model type:",
+        getattr(config, "model_type", None),
+        flush=True,
+    )
+
+    print(
+        "Architectures:",
+        getattr(config, "architectures", None),
+        flush=True,
+    )
+
+    print(
+        "Attention implementation:",
+        getattr(
+            config,
+            "_attn_implementation",
+            None,
+        ),
+        flush=True,
+    )
+
+    print(
+        "Use cache:",
+        getattr(config, "use_cache", None),
+        flush=True,
+    )
+
+    print(
+        "Cache implementation:",
+        getattr(
+            config,
+            "cache_implementation",
+            None,
+        ),
+        flush=True,
+    )
+
+    # ------------------------------------------------------------------
+    # MoE / expert configuration
+    #
+    # Different Qwen/MoE implementations use different attribute names,
+    # therefore print all common variants instead of assuming one schema.
+    # ------------------------------------------------------------------
+    expert_fields = (
+        "num_experts",
+        "num_local_experts",
+        "num_experts_per_tok",
+        "num_selected_experts",
+        "n_routed_experts",
+        "num_experts_per_token",
+        "moe_intermediate_size",
+        "shared_expert_intermediate_size",
+    )
+
+    print(
+        "MoE / expert configuration:",
+        {
+            name: getattr(config, name, None)
+            for name in expert_fields
+        },
+        flush=True,
+    )
+
+    # Useful general architecture fields while diagnosing Qwen MoE decode.
+    architecture_fields = (
+        "hidden_size",
+        "intermediate_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "head_dim",
+        "max_position_embeddings",
+    )
+
+    print(
+        "Model architecture summary:",
+        {
+            name: getattr(config, name, None)
+            for name in architecture_fields
+        },
+        flush=True,
+    )
+
+
 class ChatModel:
     """One loaded physical chat model shared by one or more logical roles."""
 
@@ -110,67 +277,9 @@ class ChatModel:
                 trust_remote_code=trust_remote_code,
             )
 
-#----------------------------------------------------------
-
-            root_model = getattr(
-                self.model,
-                "model",
-                self.model,
+            _print_gptq_runtime_diagnostics(
+                self.model
             )
-
-            kernel_classes = sorted(
-                {
-                    (
-                        f"{type(module).__module__}."
-                        f"{type(module).__name__}"
-                    )
-                    for module in root_model.modules()
-                    if any(
-                        keyword in (
-                            f"{type(module).__module__}."
-                            f"{type(module).__name__}"
-                        ).lower()
-                        for keyword in (
-                            "marlin",
-                            "triton",
-                            "exllama",
-                            "qlinear",
-                            "quantlinear",
-                        )
-                    )
-                }
-            )
-
-            print(
-                "GPTQ quantized kernel classes:",
-                kernel_classes,
-                flush=True,
-            )
-
-            device_summary = sorted(
-                {
-                    str(parameter.device)
-                    for parameter in root_model.parameters()
-                }
-            )
-
-            print(
-                "GPTQ parameter devices:",
-                device_summary,
-                flush=True,
-            )
-
-            print(
-                "GPTQ quantization config:",
-                getattr(
-                    self.model,
-                    "quantize_config",
-                    None,
-                ),
-                flush=True,
-            )
-
-#-----------------------------------------------------------
 
         elif self.backend == "transformers":
             model_kwargs: dict[str, Any] = {
