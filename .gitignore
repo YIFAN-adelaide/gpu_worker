@@ -19,10 +19,12 @@ venv/
 .idea/
 
 # Models / large files
+!/models/*.py
 /models/
 *.safetensors
 *.bin
 *.gguf
+
 
 # Logs
 *.log
@@ -30,3 +32,5 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+
