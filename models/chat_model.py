@@ -110,6 +110,68 @@ class ChatModel:
                 trust_remote_code=trust_remote_code,
             )
 
+#----------------------------------------------------------
+
+            root_model = getattr(
+                self.model,
+                "model",
+                self.model,
+            )
+
+            kernel_classes = sorted(
+                {
+                    (
+                        f"{type(module).__module__}."
+                        f"{type(module).__name__}"
+                    )
+                    for module in root_model.modules()
+                    if any(
+                        keyword in (
+                            f"{type(module).__module__}."
+                            f"{type(module).__name__}"
+                        ).lower()
+                        for keyword in (
+                            "marlin",
+                            "triton",
+                            "exllama",
+                            "qlinear",
+                            "quantlinear",
+                        )
+                    )
+                }
+            )
+
+            print(
+                "GPTQ quantized kernel classes:",
+                kernel_classes,
+                flush=True,
+            )
+
+            device_summary = sorted(
+                {
+                    str(parameter.device)
+                    for parameter in root_model.parameters()
+                }
+            )
+
+            print(
+                "GPTQ parameter devices:",
+                device_summary,
+                flush=True,
+            )
+
+            print(
+                "GPTQ quantization config:",
+                getattr(
+                    self.model,
+                    "quantize_config",
+                    None,
+                ),
+                flush=True,
+            )
+
+#-----------------------------------------------------------
+
         elif self.backend == "transformers":
             model_kwargs: dict[str, Any] = {
                 "trust_remote_code": trust_remote_code,
