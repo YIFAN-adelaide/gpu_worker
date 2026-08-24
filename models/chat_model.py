@@ -195,10 +195,12 @@ class ChatModel:
         input_preparation_seconds = (
             time.perf_counter() - preparation_started
         )
+
+        '''
         timing_streamer = _GenerationTimingStreamer(
             prompt_tokens=prompt_tokens
         )
-
+        '''
         generation_kwargs: dict[str, Any] = {
             **inputs,
             "max_new_tokens": int(max_new_tokens),
@@ -206,7 +208,7 @@ class ChatModel:
             "use_cache": True,
             "pad_token_id": self.tokenizer.pad_token_id,
             "eos_token_id": self.tokenizer.eos_token_id,
-            "streamer": timing_streamer,
+#            "streamer": timing_streamer,
         }
 
         if temperature > 0.0:
@@ -226,10 +228,15 @@ class ChatModel:
         new_tokens = outputs[0][prompt_tokens:]
         output_tokens = int(new_tokens.shape[-1])
 
+
+        #time_to_first_token_seconds: float | None = None
+        #decode_seconds: float | None = None
+        #decode_tokens_per_second: float | None = None
+
         time_to_first_token_seconds: float | None = None
         decode_seconds: float | None = None
         decode_tokens_per_second: float | None = None
-
+        '''
         if timing_streamer.first_token_at is not None:
             time_to_first_token_seconds = max(
                 0.0,
@@ -244,7 +251,7 @@ class ChatModel:
                 decode_tokens_per_second = (
                     remaining_decode_tokens / decode_seconds
                 )
-
+        '''
         text = self.tokenizer.decode(
             new_tokens,
             skip_special_tokens=True,
