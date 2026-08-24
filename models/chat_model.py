@@ -19,13 +19,56 @@ class ChatGeneration:
     finish_reason: str | None
     input_tokens: int
     output_tokens: int
+    input_preparation_seconds: float
     generation_seconds: float
+    time_to_first_token_seconds: float | None
+    decode_seconds: float | None
+    decode_tokens_per_second: float | None
 
     @property
     def tokens_per_second(self) -> float | None:
         if self.generation_seconds <= 0:
             return None
         return self.output_tokens / self.generation_seconds
+
+
+class _GenerationTimingStreamer:
+    """Minimal HF-compatible streamer used only for token timing.
+
+    Hugging Face generation normally sends the prompt once and then generated
+    tokens one by one. The prompt callback is ignored. The first generated
+    token callback marks practical TTFT. No text decoding happens here.
+    """
+
+    def __init__(self, *, prompt_tokens: int) -> None:
+        self._prompt_tokens = max(1, int(prompt_tokens))
+        self._prompt_seen = False
+        self.first_token_at: float | None = None
+        self.ended_at: float | None = None
+
+    def put(self, value: Any) -> None:
+        now = time.perf_counter()
+        token_count: int | None = None
+        numel = getattr(value, "numel", None)
+        if callable(numel):
+            try:
+                token_count = int(numel())
+            except (TypeError, ValueError):
+                token_count = None
+
+        if (
+            not self._prompt_seen
+            and token_count is not None
+            and token_count >= self._prompt_tokens
+        ):
+            self._prompt_seen = True
+            return
+
+        if self.first_token_at is None:
+            self.first_token_at = now
+
+    def end(self) -> None:
+        self.ended_at = time.perf_counter()
 
 
 class ChatModel:
@@ -126,6 +169,8 @@ class ChatModel:
                 "temperature must be between 0.0 and 2.0."
             )
 
+        preparation_started = time.perf_counter()
+
         template_kwargs: dict[str, Any] = {
             "tokenize": True,
             "add_generation_prompt": True,
@@ -147,6 +192,13 @@ class ChatModel:
             inputs["input_ids"].shape[-1]
         )
 
+        input_preparation_seconds = (
+            time.perf_counter() - preparation_started
+        )
+        timing_streamer = _GenerationTimingStreamer(
+            prompt_tokens=prompt_tokens
+        )
+
         generation_kwargs: dict[str, Any] = {
             **inputs,
             "max_new_tokens": int(max_new_tokens),
@@ -154,6 +206,7 @@ class ChatModel:
             "use_cache": True,
             "pad_token_id": self.tokenizer.pad_token_id,
             "eos_token_id": self.tokenizer.eos_token_id,
+            "streamer": timing_streamer,
         }
 
         if temperature > 0.0:
@@ -173,6 +226,25 @@ class ChatModel:
         new_tokens = outputs[0][prompt_tokens:]
         output_tokens = int(new_tokens.shape[-1])
 
+        time_to_first_token_seconds: float | None = None
+        decode_seconds: float | None = None
+        decode_tokens_per_second: float | None = None
+
+        if timing_streamer.first_token_at is not None:
+            time_to_first_token_seconds = max(
+                0.0,
+                timing_streamer.first_token_at - started,
+            )
+            decode_seconds = max(
+                0.0,
+                generation_seconds - time_to_first_token_seconds,
+            )
+            remaining_decode_tokens = max(0, output_tokens - 1)
+            if decode_seconds > 0 and remaining_decode_tokens > 0:
+                decode_tokens_per_second = (
+                    remaining_decode_tokens / decode_seconds
+                )
+
         text = self.tokenizer.decode(
             new_tokens,
             skip_special_tokens=True,
@@ -190,5 +262,9 @@ class ChatModel:
             finish_reason=finish_reason,
             input_tokens=prompt_tokens,
             output_tokens=output_tokens,
+            input_preparation_seconds=input_preparation_seconds,
             generation_seconds=generation_seconds,
+            time_to_first_token_seconds=time_to_first_token_seconds,
+            decode_seconds=decode_seconds,
+            decode_tokens_per_second=decode_tokens_per_second,
         )

@@ -119,6 +119,42 @@ def _to_gib(value_bytes: int | float) -> float:
     return round(float(value_bytes) / _GIB, 3)
 
 
+def _generation_timing_metadata(
+    generation: ChatGeneration,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "input_token_count": generation.input_tokens,
+        "output_token_count": generation.output_tokens,
+        "input_preparation_ms": round(
+            generation.input_preparation_seconds * 1000, 3
+        ),
+        "generation_total_ms": round(
+            generation.generation_seconds * 1000, 3
+        ),
+        "overall_tokens_per_second": (
+            round(generation.tokens_per_second, 4)
+            if generation.tokens_per_second is not None
+            else None
+        ),
+    }
+    if generation.time_to_first_token_seconds is not None:
+        metadata["time_to_first_token_ms"] = round(
+            generation.time_to_first_token_seconds * 1000, 3
+        )
+    if generation.decode_seconds is not None:
+        metadata["decode_time_ms"] = round(
+            generation.decode_seconds * 1000, 3
+        )
+        metadata["decode_token_count"] = max(
+            0, generation.output_tokens - 1
+        )
+    if generation.decode_tokens_per_second is not None:
+        metadata["decode_tokens_per_second"] = round(
+            generation.decode_tokens_per_second, 4
+        )
+    return {k: v for k, v in metadata.items() if v is not None}
+
+
 # ---------------------------------------------------------------------------
 # API schemas
 # ---------------------------------------------------------------------------
@@ -188,14 +224,13 @@ class GenerateResponse(BaseModel):
     finish_reason: str | None = None
     input_tokens: int = Field(ge=0)
     output_tokens: int = Field(ge=0)
+    input_preparation_seconds: float = Field(ge=0)
     generation_seconds: float = Field(ge=0)
-    tokens_per_second: float | None = Field(
-        default=None,
-        ge=0,
-    )
-    metadata: dict[str, Any] = Field(
-        default_factory=dict
-    )
+    time_to_first_token_seconds: float | None = Field(default=None, ge=0)
+    decode_seconds: float | None = Field(default=None, ge=0)
+    tokens_per_second: float | None = Field(default=None, ge=0)
+    decode_tokens_per_second: float | None = Field(default=None, ge=0)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -892,6 +927,8 @@ def _generate(
     response_metadata: dict[str, Any] = {
         "requested_max_output_tokens": int(requested_max),
         "effective_max_output_tokens": int(max_output_tokens),
+        "response_model_backend": model.backend,
+        "response_enable_thinking": model.enable_thinking,
     }
 
     if response_model_vram_gb is not None:
@@ -904,6 +941,9 @@ def _generate(
             messages=messages,
             max_new_tokens=max_output_tokens,
             temperature=req.temperature,
+        )
+        response_metadata.update(
+            _generation_timing_metadata(generation)
         )
         return GenerationExecution(
             generation=generation,
@@ -969,6 +1009,9 @@ def _generate(
                 )
             ),
         }
+    )
+    response_metadata.update(
+        _generation_timing_metadata(generation)
     )
 
     return GenerationExecution(
@@ -1064,11 +1107,21 @@ async def generate(
         finish_reason=generation.finish_reason,
         input_tokens=generation.input_tokens,
         output_tokens=generation.output_tokens,
+        input_preparation_seconds=(
+            generation.input_preparation_seconds
+        ),
         generation_seconds=(
             generation.generation_seconds
         ),
+        time_to_first_token_seconds=(
+            generation.time_to_first_token_seconds
+        ),
+        decode_seconds=generation.decode_seconds,
         tokens_per_second=(
             generation.tokens_per_second
+        ),
+        decode_tokens_per_second=(
+            generation.decode_tokens_per_second
         ),
         metadata={
             "profile": req.profile,
