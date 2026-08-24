@@ -18,12 +18,6 @@ venv/
 .vscode/
 .idea/
 
-# Models / large files
-/models/
-*.safetensors
-*.bin
-*.gguf
-
 # Logs
 *.log
 
