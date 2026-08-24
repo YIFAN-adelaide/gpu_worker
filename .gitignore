@@ -19,7 +19,7 @@ venv/
 .idea/
 
 # Models / large files
-models/
+/models/
 *.safetensors
 *.bin
 *.gguf
