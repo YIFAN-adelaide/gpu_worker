@@ -51,6 +51,7 @@ from .models import (
     ChatModel,
     QueryDecomposer,
 )
+from .models.vllm_client import VLLMChatModel
 
 
 SETTINGS: GPUWorkerSettings = load_settings()
@@ -67,7 +68,7 @@ PARENT_SPAN_ID_HEADER = "X-Langfuse-Parent-Span-Id"
 embedding_model: BGEM3EmbeddingModel | None = None
 small_llm: ChatModel | None = None
 decomposer: QueryDecomposer | None = None
-response_llm: ChatModel | None = None
+response_llm: ChatModel | VLLMChatModel | None = None
 
 # Approximate static VRAM added when the response model is loaded.
 response_model_vram_gb: float | None = None
@@ -555,59 +556,84 @@ def _load_models() -> None:
         )
 
     if SETTINGS.load_response_llm:
-        assert SETTINGS.response_llm_model_path is not None
-
-        if (
-            small_llm is not None
-            and SETTINGS.response_llm_model_path
-            == SETTINGS.small_llm_model_path
-        ):
-            response_llm = small_llm
-            response_model_vram_gb = 0.0
-
-        else:
+        if SETTINGS.response_backend == "vllm":
             print(
-                "Loading response chat model...",
+                "Connecting response profile to vLLM...",
                 flush=True,
             )
 
-            free_before: int | None = None
-
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-                free_before, _total_before = (
-                    torch.cuda.mem_get_info()
-                )
-
-            response_llm = ChatModel(
-                model_path=SETTINGS.response_llm_model_path,
+            response_llm = VLLMChatModel(
+                base_url=SETTINGS.vllm_base_url,
+                model_name=SETTINGS.vllm_model_name,
+                timeout_seconds=SETTINGS.vllm_timeout_seconds,
                 enable_thinking=SETTINGS.response_llm_enable_thinking,
-                trust_remote_code=SETTINGS.trust_remote_code,
-                device_map=SETTINGS.device_map,
-                backend="gptqmodel",
+                api_key=SETTINGS.vllm_api_key,
             )
 
+            # Fail early if vLLM is not running or the expected served model
+            # name is unavailable. No 30B weights are loaded in this process.
+            response_llm.ensure_ready()
+            response_model_vram_gb = None
+
+            print(
+                "Response profile connected to vLLM.",
+                flush=True,
+            )
+
+        else:
+            assert SETTINGS.response_llm_model_path is not None
+
             if (
-                torch.cuda.is_available()
-                and free_before is not None
+                small_llm is not None
+                and SETTINGS.response_llm_model_path
+                == SETTINGS.small_llm_model_path
             ):
-                torch.cuda.synchronize()
-                free_after, _total_after = (
-                    torch.cuda.mem_get_info()
-                )
-                response_model_vram_gb = _to_gib(
-                    max(0, free_before - free_after)
-                )
+                response_llm = small_llm
+                response_model_vram_gb = 0.0
+
+            else:
                 print(
-                    "Approximate response-model VRAM: "
-                    f"{response_model_vram_gb:.3f} GiB",
+                    "Loading response chat model...",
                     flush=True,
                 )
 
-        print(
-            "Response model loaded.",
-            flush=True,
-        )
+                free_before: int | None = None
+
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    free_before, _total_before = (
+                        torch.cuda.mem_get_info()
+                    )
+
+                response_llm = ChatModel(
+                    model_path=SETTINGS.response_llm_model_path,
+                    enable_thinking=SETTINGS.response_llm_enable_thinking,
+                    trust_remote_code=SETTINGS.trust_remote_code,
+                    device_map=SETTINGS.device_map,
+                    backend="gptqmodel",
+                )
+
+                if (
+                    torch.cuda.is_available()
+                    and free_before is not None
+                ):
+                    torch.cuda.synchronize()
+                    free_after, _total_after = (
+                        torch.cuda.mem_get_info()
+                    )
+                    response_model_vram_gb = _to_gib(
+                        max(0, free_before - free_after)
+                    )
+                    print(
+                        "Approximate response-model VRAM: "
+                        f"{response_model_vram_gb:.3f} GiB",
+                        flush=True,
+                    )
+
+            print(
+                "Response model loaded.",
+                flush=True,
+            )
 
     print(
         "GPU after loading:",
@@ -707,6 +733,7 @@ async def health():
             SETTINGS.profile_configuration
         ),
         "models": _model_labels(),
+        "response_backend": SETTINGS.response_backend,
         "gpu_worker_running": (
             gpu_worker_task is not None
             and not gpu_worker_task.done()
@@ -934,6 +961,24 @@ def _generate(
     if response_model_vram_gb is not None:
         response_metadata["response_model_vram_gb"] = (
             response_model_vram_gb
+        )
+
+    # vLLM owns the 30B model in a separate process. Do not report this
+    # worker process's torch allocator statistics as response-model VRAM.
+    if model.backend == "vllm":
+        generation = model.generate(
+            messages=messages,
+            max_new_tokens=max_output_tokens,
+            temperature=req.temperature,
+        )
+        response_metadata.update(
+            _generation_timing_metadata(generation)
+        )
+        response_metadata["vllm_model_name"] = model.model_name
+
+        return GenerationExecution(
+            generation=generation,
+            metadata=response_metadata,
         )
 
     if not torch.cuda.is_available():

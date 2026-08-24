@@ -59,6 +59,15 @@ def _optional_path(name: str) -> str | None:
     return cleaned or None
 
 
+def _optional_string(name: str) -> str | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+
+    cleaned = raw.strip()
+    return cleaned or None
+
+
 @dataclass(frozen=True, slots=True)
 class GPUWorkerSettings:
     host: str
@@ -77,6 +86,12 @@ class GPUWorkerSettings:
     bge_model_path: str | None
     small_llm_model_path: str | None
     response_llm_model_path: str | None
+
+    response_backend: str
+    vllm_base_url: str
+    vllm_model_name: str
+    vllm_timeout_seconds: float
+    vllm_api_key: str | None
 
     bge_batch_size: int
     bge_max_seq_length: int
@@ -116,11 +131,33 @@ class GPUWorkerSettings:
                 "GPU_LOAD_SMALL_LLM=true."
             )
 
-        if self.load_response_llm and not self.response_llm_model_path:
+        if self.response_backend not in {"gptqmodel", "vllm"}:
             raise ValueError(
-                "RESPONSE_LLM_MODEL_PATH is required when "
-                "GPU_LOAD_RESPONSE_LLM=true."
+                "RESPONSE_BACKEND must be either 'gptqmodel' or 'vllm'."
             )
+
+        if self.load_response_llm:
+            if (
+                self.response_backend == "gptqmodel"
+                and not self.response_llm_model_path
+            ):
+                raise ValueError(
+                    "RESPONSE_LLM_MODEL_PATH is required when "
+                    "GPU_LOAD_RESPONSE_LLM=true and "
+                    "RESPONSE_BACKEND=gptqmodel."
+                )
+
+            if self.response_backend == "vllm":
+                if not self.vllm_base_url.strip():
+                    raise ValueError(
+                        "VLLM_BASE_URL cannot be empty when "
+                        "RESPONSE_BACKEND=vllm."
+                    )
+                if not self.vllm_model_name.strip():
+                    raise ValueError(
+                        "VLLM_MODEL_NAME cannot be empty when "
+                        "RESPONSE_BACKEND=vllm."
+                    )
 
 
 def load_settings(
@@ -187,6 +224,29 @@ def load_settings(
         response_llm_model_path=_optional_path(
             "RESPONSE_LLM_MODEL_PATH"
         ),
+        response_backend=(
+            os.getenv("RESPONSE_BACKEND", "gptqmodel").strip().lower()
+            or "gptqmodel"
+        ),
+        vllm_base_url=(
+            os.getenv(
+                "VLLM_BASE_URL",
+                "http://127.0.0.1:8100",
+            ).strip().rstrip("/")
+            or "http://127.0.0.1:8100"
+        ),
+        vllm_model_name=(
+            os.getenv(
+                "VLLM_MODEL_NAME",
+                "expertease-response",
+            ).strip()
+            or "expertease-response"
+        ),
+        vllm_timeout_seconds=_env_float(
+            "VLLM_TIMEOUT_SECONDS",
+            180.0,
+        ),
+        vllm_api_key=_optional_string("VLLM_API_KEY"),
         bge_batch_size=_env_int("BGE_BATCH_SIZE", 16),
         bge_max_seq_length=_env_int(
             "BGE_MAX_SEQ_LENGTH",
