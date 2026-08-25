@@ -6,6 +6,7 @@ GET  /health
 POST /embed
 POST /decompose
 POST /generate
+POST /generate/stream
 
 The same server can run on a local GPU or AWS. Individual model groups are
 enabled through environment variables so a smaller local device can advertise
@@ -27,11 +28,13 @@ Large chat model (for example Qwen 30B):
 from __future__ import annotations
 
 import asyncio
+import json
 import hmac
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
+from collections.abc import AsyncIterator
 from typing import Any, Callable, Literal
 from uuid import uuid4
 
@@ -43,6 +46,7 @@ from fastapi import (
     Response,
 )
 from pydantic import BaseModel, Field
+from starlette.responses import StreamingResponse
 
 from .config import GPUWorkerSettings, load_settings
 from .models import (
@@ -484,6 +488,217 @@ async def _submit_gpu_job(
                 "timeout_seconds": timeout_seconds,
             },
         ) from exc
+
+
+
+# ---------------------------------------------------------------------------
+# Streaming GPU generation
+# ---------------------------------------------------------------------------
+
+_STREAM_END = object()
+
+
+def _sse_event(
+    event_type: str,
+    data: dict[str, Any],
+) -> bytes:
+    payload = json.dumps(
+        data,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return (
+        f"event: {event_type}\\n"
+        f"data: {payload}\\n\\n"
+    ).encode("utf-8")
+
+
+async def _stream_response_generation(
+    *,
+    req: GenerateRequest,
+    request_id: str,
+) -> AsyncIterator[bytes]:
+    """Stream one vLLM response while holding the GPU queue slot."""
+
+    if response_llm is None:
+        yield _sse_event(
+            "error",
+            {
+                "message": "Response profile is not available.",
+                "request_id": request_id,
+            },
+        )
+        return
+
+    if response_llm.backend != "vllm":
+        yield _sse_event(
+            "error",
+            {
+                "message": (
+                    "Streaming currently requires the vLLM backend."
+                ),
+                "request_id": request_id,
+            },
+        )
+        return
+
+    assert isinstance(response_llm, VLLMChatModel)
+
+    if (
+        gpu_queue is None
+        or gpu_worker_task is None
+        or gpu_worker_task.done()
+    ):
+        yield _sse_event(
+            "error",
+            {
+                "message": "GPU worker is not ready.",
+                "request_id": request_id,
+            },
+        )
+        return
+
+    requested_max = (
+        req.max_output_tokens
+        if req.max_output_tokens is not None
+        else SETTINGS.response_max_output_tokens
+    )
+    max_output_tokens = min(
+        requested_max,
+        SETTINGS.response_max_output_tokens,
+    )
+
+    messages = [
+        message.model_dump(mode="json")
+        for message in req.messages
+    ]
+
+    loop = asyncio.get_running_loop()
+    stream_queue: asyncio.Queue[Any] = asyncio.Queue()
+    completion_future: asyncio.Future[Any] = loop.create_future()
+    submitted_at = time.perf_counter()
+
+    def run_stream(queue_wait_ms: float) -> dict[str, Any]:
+        execution_started = time.perf_counter()
+        final_event: dict[str, Any] | None = None
+
+        try:
+            loop.call_soon_threadsafe(
+                stream_queue.put_nowait,
+                {
+                    "type": "start",
+                    "request_id": request_id,
+                    "profile": "response",
+                    "gpu_queue_wait_ms": round(
+                        queue_wait_ms,
+                        3,
+                    ),
+                },
+            )
+
+            for event in response_llm.stream_generate(
+                messages=messages,
+                max_new_tokens=max_output_tokens,
+                temperature=req.temperature,
+            ):
+                if event.get("type") == "done":
+                    final_event = dict(event)
+                else:
+                    loop.call_soon_threadsafe(
+                        stream_queue.put_nowait,
+                        event,
+                    )
+
+            execution_ms = (
+                time.perf_counter() - execution_started
+            ) * 1000
+
+            if final_event is None:
+                final_event = {"type": "done"}
+
+            final_event["request_id"] = request_id
+            final_event["profile"] = "response"
+            final_event["metadata"] = {
+                "requested_max_output_tokens": int(
+                    requested_max
+                ),
+                "effective_max_output_tokens": int(
+                    max_output_tokens
+                ),
+                "response_model_backend": "vllm",
+                "response_enable_thinking": (
+                    response_llm.enable_thinking
+                ),
+                "vllm_model_name": response_llm.model_name,
+                "gpu_queue_wait_ms": round(
+                    queue_wait_ms,
+                    3,
+                ),
+                "gpu_execution_ms": round(
+                    execution_ms,
+                    3,
+                ),
+            }
+
+            loop.call_soon_threadsafe(
+                stream_queue.put_nowait,
+                final_event,
+            )
+            return final_event
+
+        except Exception as exc:
+            loop.call_soon_threadsafe(
+                stream_queue.put_nowait,
+                {
+                    "type": "error",
+                    "message": str(exc),
+                    "request_id": request_id,
+                    "profile": "response",
+                },
+            )
+            raise
+        finally:
+            loop.call_soon_threadsafe(
+                stream_queue.put_nowait,
+                _STREAM_END,
+            )
+
+    job = GPUJob(
+        request_id=request_id,
+        job_type="generation:response:stream",
+        function=run_stream,
+        future=completion_future,
+        submitted_at=submitted_at,
+    )
+
+    try:
+        gpu_queue.put_nowait(job)
+    except asyncio.QueueFull:
+        yield _sse_event(
+            "error",
+            {
+                "message": (
+                    "The GPU server is currently at capacity."
+                ),
+                "request_id": request_id,
+                "queue_capacity": SETTINGS.queue_maxsize,
+            },
+        )
+        return
+
+    while True:
+        item = await stream_queue.get()
+        if item is _STREAM_END:
+            break
+
+        event_type = str(item.get("type", "message"))
+        yield _sse_event(event_type, item)
+
+    try:
+        await completion_future
+    except Exception:
+        # The error event has already been sent through the stream.
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1067,6 +1282,75 @@ def _generate(
     return GenerationExecution(
         generation=generation,
         metadata=response_metadata,
+    )
+
+
+
+@app.post("/generate/stream")
+async def generate_stream(
+    req: GenerateRequest,
+    authorization: str | None = Header(
+        default=None,
+        alias="Authorization",
+    ),
+    incoming_request_id: str | None = Header(
+        default=None,
+        alias=REQUEST_ID_HEADER,
+    ),
+):
+    """Stream only the 30B response profile as SSE."""
+
+    _authorize(authorization)
+
+    if req.profile != "response":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": (
+                    "Streaming is supported only for "
+                    "profile='response'."
+                ),
+                "profile": req.profile,
+            },
+        )
+
+    if response_llm is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": (
+                    "Response profile is not available "
+                    "on this worker."
+                ),
+                "profile": "response",
+            },
+        )
+
+    if response_llm.backend != "vllm":
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": (
+                    "Response streaming requires the vLLM backend."
+                ),
+                "profile": "response",
+                "backend": response_llm.backend,
+            },
+        )
+
+    request_id = _request_id(incoming_request_id)
+
+    return StreamingResponse(
+        _stream_response_generation(
+            req=req,
+            request_id=request_id,
+        ),
+        media_type="text/event-stream",
+        headers={
+            REQUEST_ID_HEADER: request_id,
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

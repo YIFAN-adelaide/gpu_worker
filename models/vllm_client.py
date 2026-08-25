@@ -13,6 +13,7 @@ import json
 import socket
 import time
 from json import JSONDecodeError
+from collections.abc import Iterator
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -149,6 +150,191 @@ class VLLMChatModel:
             generation_seconds=generation_seconds,
             input_preparation_seconds=input_preparation_seconds,
         )
+
+
+    def stream_generate(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        max_new_tokens: int,
+        temperature: float = 0.0,
+    ) -> Iterator[dict[str, Any]]:
+        """Yield token and final events from vLLM's SSE stream."""
+
+        if not messages:
+            raise ValueError("messages cannot be empty.")
+        if max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be positive.")
+        if not 0.0 <= temperature <= 2.0:
+            raise ValueError(
+                "temperature must be between 0.0 and 2.0."
+            )
+
+        preparation_started = time.perf_counter()
+
+        payload: dict[str, Any] = {
+            "model": self.model_name,
+            "messages": messages,
+            "temperature": float(temperature),
+            "max_tokens": int(max_new_tokens),
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "chat_template_kwargs": {
+                "enable_thinking": self.enable_thinking,
+            },
+        }
+
+        body = json.dumps(payload).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        request = Request(
+            url=f"{self.base_url}/v1/chat/completions",
+            data=body,
+            headers=headers,
+            method="POST",
+        )
+
+        input_preparation_seconds = (
+            time.perf_counter() - preparation_started
+        )
+
+        started = time.perf_counter()
+        first_token_at: float | None = None
+        last_token_at: float | None = None
+        finish_reason: str | None = None
+        input_tokens = 0
+        output_tokens = 0
+        returned_model = self.model_name
+
+        try:
+            with urlopen(
+                request,
+                timeout=self.timeout_seconds,
+            ) as response:
+                for raw_line in response:
+                    try:
+                        line = raw_line.decode("utf-8").strip()
+                    except UnicodeDecodeError as exc:
+                        raise VLLMClientError(
+                            "vLLM returned malformed UTF-8 in stream."
+                        ) from exc
+
+                    if not line or line.startswith(":"):
+                        continue
+                    if not line.startswith("data:"):
+                        continue
+
+                    payload_text = line[5:].strip()
+                    if payload_text == "[DONE]":
+                        break
+
+                    try:
+                        data = json.loads(payload_text)
+                    except JSONDecodeError as exc:
+                        raise VLLMClientError(
+                            "vLLM returned malformed JSON in stream."
+                        ) from exc
+
+                    if not isinstance(data, dict):
+                        continue
+
+                    if data.get("model"):
+                        returned_model = str(data["model"])
+
+                    usage = data.get("usage")
+                    if isinstance(usage, dict):
+                        input_tokens = _safe_non_negative_int(
+                            usage.get("prompt_tokens")
+                        )
+                        output_tokens = _safe_non_negative_int(
+                            usage.get("completion_tokens")
+                        )
+
+                    choices = data.get("choices")
+                    if not isinstance(choices, list):
+                        continue
+
+                    for choice in choices:
+                        if not isinstance(choice, dict):
+                            continue
+
+                        choice_finish = choice.get("finish_reason")
+                        if choice_finish is not None:
+                            finish_reason = str(choice_finish)
+
+                        delta = choice.get("delta")
+                        if not isinstance(delta, dict):
+                            continue
+
+                        text = delta.get("content")
+                        if not isinstance(text, str) or not text:
+                            continue
+
+                        now = time.perf_counter()
+                        if first_token_at is None:
+                            first_token_at = now
+                        last_token_at = now
+
+                        yield {
+                            "type": "token",
+                            "text": text,
+                        }
+
+        except HTTPError as exc:
+            detail = _read_error_body(exc)
+            raise VLLMClientError(
+                f"vLLM returned HTTP {exc.code}: {detail}"
+            ) from exc
+        except (URLError, TimeoutError, socket.timeout) as exc:
+            raise VLLMClientError(
+                f"Unable to reach vLLM at {self.base_url}: {exc}"
+            ) from exc
+
+        finished_at = time.perf_counter()
+        generation_seconds = finished_at - started
+
+        ttft = (
+            first_token_at - started
+            if first_token_at is not None
+            else None
+        )
+
+        decode_seconds: float | None = None
+        decode_tokens_per_second: float | None = None
+
+        if (
+            first_token_at is not None
+            and last_token_at is not None
+            and output_tokens > 1
+        ):
+            decode_seconds = max(
+                0.0,
+                last_token_at - first_token_at,
+            )
+            if decode_seconds > 0:
+                decode_tokens_per_second = (
+                    (output_tokens - 1) / decode_seconds
+                )
+
+        yield {
+            "type": "done",
+            "model_name": returned_model,
+            "finish_reason": finish_reason,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "input_preparation_seconds": input_preparation_seconds,
+            "generation_seconds": generation_seconds,
+            "time_to_first_token_seconds": ttft,
+            "decode_seconds": decode_seconds,
+            "decode_tokens_per_second": (
+                decode_tokens_per_second
+            ),
+        }
 
     def health(self) -> dict[str, Any]:
         """Return vLLM's model registry response.
