@@ -508,8 +508,8 @@ def _sse_event(
         separators=(",", ":"),
     )
     return (
-        f"event: {event_type}\\n"
-        f"data: {payload}\\n\\n"
+        f"event: {event_type}\n"
+        f"data: {payload}\n\n"
     ).encode("utf-8")
 
 
