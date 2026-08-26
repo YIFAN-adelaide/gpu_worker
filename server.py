@@ -39,6 +39,22 @@ from typing import Any, Callable, Literal
 from uuid import uuid4
 
 import torch
+
+try:
+    from pynvml import (
+        nvmlDeviceGetHandleByIndex,
+        nvmlDeviceGetPowerUsage,
+        nvmlDeviceGetUtilizationRates,
+        nvmlInit,
+    )
+    _NVML_AVAILABLE = True
+except ImportError:
+    nvmlDeviceGetHandleByIndex = None  # type: ignore[assignment]
+    nvmlDeviceGetPowerUsage = None  # type: ignore[assignment]
+    nvmlDeviceGetUtilizationRates = None  # type: ignore[assignment]
+    nvmlInit = None  # type: ignore[assignment]
+    _NVML_AVAILABLE = False
+
 from fastapi import (
     FastAPI,
     Header,
@@ -122,6 +138,145 @@ _GIB = 1024 ** 3
 
 def _to_gib(value_bytes: int | float) -> float:
     return round(float(value_bytes) / _GIB, 3)
+
+
+_nvml_handle: Any | None = None
+_nvml_initialization_attempted = False
+
+
+def _get_nvml_handle() -> Any | None:
+    """Return GPU-0 NVML handle, failing open if NVML is unavailable."""
+    global _nvml_handle
+    global _nvml_initialization_attempted
+
+    if _nvml_handle is not None:
+        return _nvml_handle
+
+    if _nvml_initialization_attempted:
+        return None
+
+    _nvml_initialization_attempted = True
+
+    if (
+        not _NVML_AVAILABLE
+        or nvmlInit is None
+        or nvmlDeviceGetHandleByIndex is None
+    ):
+        return None
+
+    try:
+        nvmlInit()
+        _nvml_handle = nvmlDeviceGetHandleByIndex(0)
+    except Exception:
+        _nvml_handle = None
+
+    return _nvml_handle
+
+
+def _gpu_runtime_snapshot() -> dict[str, Any]:
+    """Capture device-wide GPU state for the physical GPU.
+
+    CUDA free/total VRAM is device-wide and therefore includes the separate
+    vLLM process. NVML adds device-wide utilization and power when available.
+    Telemetry is fail-open and must never break generation.
+    """
+    if not torch.cuda.is_available():
+        return {}
+
+    snapshot: dict[str, Any] = {}
+
+    try:
+        free, total = torch.cuda.mem_get_info(0)
+        snapshot.update(
+            {
+                'gpu_total_vram_gb': _to_gib(total),
+                'gpu_free_vram_gb': _to_gib(free),
+                'gpu_used_vram_gb': _to_gib(total - free),
+            }
+        )
+    except Exception:
+        pass
+
+    handle = _get_nvml_handle()
+    if handle is None:
+        return snapshot
+
+    try:
+        if nvmlDeviceGetUtilizationRates is not None:
+            utilization = nvmlDeviceGetUtilizationRates(handle)
+            snapshot['gpu_utilization_percent'] = float(utilization.gpu)
+            snapshot['gpu_memory_utilization_percent'] = float(
+                utilization.memory
+            )
+    except Exception:
+        pass
+
+    try:
+        if nvmlDeviceGetPowerUsage is not None:
+            power_mw = nvmlDeviceGetPowerUsage(handle)
+            snapshot['gpu_power_w'] = round(
+                float(power_mw) / 1000.0,
+                3,
+            )
+    except Exception:
+        pass
+
+    return snapshot
+
+
+def _gpu_before_after_metadata(
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> dict[str, Any]:
+    """Flatten before/after GPU snapshots into response metadata."""
+    metadata: dict[str, Any] = {}
+
+    total = (
+        before.get('gpu_total_vram_gb')
+        if before.get('gpu_total_vram_gb') is not None
+        else after.get('gpu_total_vram_gb')
+    )
+    if total is not None:
+        metadata['gpu_total_vram_gb'] = total
+
+    pairs = (
+        ('gpu_free_vram_gb', 'gpu_free_before_gb', 'gpu_free_after_gb'),
+        ('gpu_used_vram_gb', 'gpu_used_before_gb', 'gpu_used_after_gb'),
+        (
+            'gpu_utilization_percent',
+            'gpu_utilization_before_percent',
+            'gpu_utilization_after_percent',
+        ),
+        (
+            'gpu_memory_utilization_percent',
+            'gpu_memory_utilization_before_percent',
+            'gpu_memory_utilization_after_percent',
+        ),
+        ('gpu_power_w', 'gpu_power_before_w', 'gpu_power_after_w'),
+    )
+
+    for source_key, before_key, after_key in pairs:
+        before_value = before.get(source_key)
+        after_value = after.get(source_key)
+
+        if before_value is not None:
+            metadata[before_key] = before_value
+        if after_value is not None:
+            metadata[after_key] = after_value
+
+    used_before = before.get('gpu_used_vram_gb')
+    used_after = after.get('gpu_used_vram_gb')
+
+    if (
+        isinstance(used_before, (int, float))
+        and isinstance(used_after, (int, float))
+    ):
+        metadata['gpu_used_delta_gb'] = round(
+            float(used_after) - float(used_before),
+            3,
+        )
+
+    return metadata
 
 
 def _generation_timing_metadata(
@@ -581,6 +736,7 @@ async def _stream_response_generation(
     def run_stream(queue_wait_ms: float) -> dict[str, Any]:
         execution_started = time.perf_counter()
         final_event: dict[str, Any] | None = None
+        gpu_before = _gpu_runtime_snapshot()
 
         try:
             loop.call_soon_threadsafe(
@@ -616,6 +772,8 @@ async def _stream_response_generation(
             if final_event is None:
                 final_event = {"type": "done"}
 
+            gpu_after = _gpu_runtime_snapshot()
+
             final_event["request_id"] = request_id
             final_event["profile"] = "response"
             final_event["metadata"] = {
@@ -637,6 +795,10 @@ async def _stream_response_generation(
                 "gpu_execution_ms": round(
                     execution_ms,
                     3,
+                ),
+                **_gpu_before_after_metadata(
+                    gpu_before,
+                    gpu_after,
                 ),
             }
 
@@ -1186,13 +1348,24 @@ def _generate(
     # vLLM owns the 30B model in a separate process. Do not report this
     # worker process's torch allocator statistics as response-model VRAM.
     if model.backend == "vllm":
+        gpu_before = _gpu_runtime_snapshot()
+
         generation = model.generate(
             messages=messages,
             max_new_tokens=max_output_tokens,
             temperature=req.temperature,
         )
+
+        gpu_after = _gpu_runtime_snapshot()
+
         response_metadata.update(
             _generation_timing_metadata(generation)
+        )
+        response_metadata.update(
+            _gpu_before_after_metadata(
+                gpu_before,
+                gpu_after,
+            )
         )
         response_metadata["vllm_model_name"] = model.model_name
 
